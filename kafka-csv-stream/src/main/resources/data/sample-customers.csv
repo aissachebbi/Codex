@@ -1,0 +1,4 @@
+id,first_name,last_name,email,signup_date,loyalty_points
+1,Anaïs,Martin,anais.martin@example.com,2023-01-12,120
+2,Noah,Durand,noah.durand@example.com,2023-02-03,75
+3,Léa,Bernard,lea.bernard@example.com,2022-12-22,980
