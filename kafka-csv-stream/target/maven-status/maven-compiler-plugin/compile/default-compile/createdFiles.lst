@@ -1,0 +1,4 @@
+com/example/kafkacsv/config/KafkaProducerConfig.class
+com/example/kafkacsv/service/CsvStreamProducer.class
+com/example/kafkacsv/KafkaCsvApplication.class
+com/example/kafkacsv/model/CustomerRecord.class

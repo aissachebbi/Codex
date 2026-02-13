@@ -1,0 +1,8 @@
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    properties:
+      security.protocol: PLAINTEXT
+app:
+  kafka:
+    customer-topic: customers.csv.ingested

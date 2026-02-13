@@ -1,0 +1,4 @@
+/workspace/Codex/kafka-csv-stream/src/main/java/com/example/kafkacsv/service/CsvStreamProducer.java
+/workspace/Codex/kafka-csv-stream/src/main/java/com/example/kafkacsv/config/KafkaProducerConfig.java
+/workspace/Codex/kafka-csv-stream/src/main/java/com/example/kafkacsv/model/CustomerRecord.java
+/workspace/Codex/kafka-csv-stream/src/main/java/com/example/kafkacsv/KafkaCsvApplication.java
