@@ -1,0 +1,33 @@
+Voici une version corrigée, structurée et prête à envoyer à l’expert technique/métier.
+Objet : Questions de clarification – FlowRegistry / CBMessage → CBFile / Notification AQ / Timeout
+Bonjour,
+Dans le cadre de la solution présentée (polling CBMessage, agrégation par branche/flow, création CBFile, mise à jour des tables business et notification AQ), j’aurais besoin de clarifications sur les points suivants :
+• Chargement des configurations & construction du FlowRegistry
+• Quel est le composant/bean attendu pour charger la configuration de chaque flow et construire le FlowRegistry au démarrage ?
+• A-t-on déjà une implémentation existante (ex. bootstrapper/service dédié), ou faut-il la créer ?
+• Quelles sont les sources de vérité côté base (table ApplicationParameter uniquement ? d’autres tables ?) et quel format de données est attendu ?
+• Notification Oracle AQ : composant responsable & construction du message
+• Quelle est la classe / configuration (Java/XML) qui doit gérer l’envoi de la notification vers Oracle AQ ?
+• Quel est le format exact de la notification (type de payload : RAW, objet Oracle, JSON/CLOB, autre) ?
+• Existe-t-il déjà un builder / factory / DTO standard pour construire cette notification ? Si oui, lequel (nom de classe / package) ?
+• Confirmez-vous que l’enqueue doit être fait en mode transactionnel (visibility ON_COMMIT) et avec quels champs obligatoires ?
+• Mise à jour de la table business CBL_* (ex : CBL_Business_MTM_IN) : clé de liaison
+• Pour relier CBMESSAGE à CBL_Business_MTM_IN, quelle colonne fait foi ?
+• Confirmez-vous que la jointure doit se faire via CBL_*.MSG_ID = CBMESSAGE.ID ?
+• Y a-t-il d’autres contraintes (index existants, unicité, cardinalité 1–1 / 1–N) à respecter ?
+• Colonnes techniques à ajouter dans CBMESSAGE (fiabilisation, non-retraitement)
+• Pouvez-vous confirmer la liste des colonnes techniques à ajouter pour sécuriser le traitement multi-instance et éviter le retraitement ?
+• Proposition (à valider) : STATUS (NEW/IN_PROGRESS/DONE/ERROR), CLAIMED_BY, CLAIMED_AT, éventuellement TRY_COUNT, LAST_ERROR, FILE_ID.
+• Y a-t-il des conventions internes (noms/valeurs) déjà utilisées dans l’application ou dans d’autres flux ?
+• Traçabilité / audit : réutiliser l’Event Log existant ou créer une nouvelle table ?
+• Doit-on réutiliser l’Event Log existant (actuellement orienté “File”, avec statuts et une colonne FLOW_TYPE) pour tracer aussi les statuts/messages/agrégats ?
+• Ou bien faut-il créer une nouvelle table dédiée (ex. audit CBMessage / lots / notifications) ?
+• Si on réutilise l’Event Log : quels FLOW_TYPE/statuts supplémentaires sont attendus, et quel niveau de granularité (par message vs par lot vs par fichier) ?
+• Timeout d’agrégation : sémantique attendue (démarrage et évolution du timer)
+• Le timeout doit-il démarrer à partir du premier message du lot (deadline fixe “création du groupe”) ?
+• Ou bien doit-il être un timeout d’inactivité (timer réinitialisé à chaque nouveau message reçu, “sliding”) ?
+• Les valeurs de timeout/limites doivent-elles être dynamiques par branche/flow (chargées via DB/FlowRegistry) et avec quelles règles métier (COB/jour non ouvré, ouverture de branche, etc.) ?
+Merci d’avance pour votre aide sur ces clarifications.
+Une fois ces points validés, on pourra figer le design (tables/colonnes, stratégie timeout/limites, format notif AQ, et composants Spring Integration).
+Bien cordialement,
+Aïssa
