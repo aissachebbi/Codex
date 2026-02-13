@@ -1,0 +1,121 @@
+# Conception — Orchestration CBMessage → CBFile → Business Table → Oracle AQ (Spring Integration 5.5 / Java 8 / Oracle 19c / JDBC) > **Objectif** : mettre en place un workflow robuste (multi-instances) qui : > 1) lit des messages en base Oracle (**CBMESSAGE / CBMSG**) via JDBC, > 2) agrège par **branche** (et/ou par **FileName** = lot), > 3) crée un **fichier logique** (INSERT **CBFILE**), > 4) met à jour les messages (CBMESSAGE + table business `CBL_Business_*`) avec `FILE_ID`, > 5) puis publie une **notification** dans **Oracle AQ** en mode transactionnel (**ON_COMMIT**), > 6) avec des **channels explicites** pour permettre l’audit par interception. --- ## 1. Contexte & contraintes - **Technos** : Spring 5, Spring Integration **5.5**, Java 8, JDBC (pas de JPA), Oracle **19c**, Oracle AQ. - **Exécution** : plusieurs instances de l’application (cluster). - **Table source** : `CBMESSAGE` (≈ 15–20 colonnes), mais on ne consomme que : - `ID` - `BRANCH` (ou branchCode) - `FILENAME` - **Spécificité COB / jour non ouvré** : - pendant COB (branche “fermée”), la rotation de lot peut être suspendue pour produire **un seul lot** sur la période. - on dispose au runtime de : `easyFlowMonitoringService.isOpenDay(branchCode)` (Java). --- ## 2. Principes de robustesse (multi-instances) ### 2.1 Lecture concurrente : `FOR UPDATE SKIP LOCKED` Pour éviter que 2 instances traitent les mêmes lignes, on utilise Oracle `SELECT … FOR UPDATE SKIP LOCKED`. Oracle indique que `SKIP LOCKED` est **“designed for use in multiconsumer queue environments”**. 0 > **Pattern** : > - transaction courte : sélectionner + verrouiller, puis marquer `IN_PROGRESS`, puis commit, > - aucune instance n’attend une autre (les lignes verrouillées sont sautées). ### 2.2 Oracle AQ transactionnel “ON_COMMIT” Pour l’enqueue, on force `visibility => ON_COMMIT` afin que la notification ne soit visible qu’après commit. 1 Pré-requis droits : `EXECUTE` sur `DBMS_AQ` + privilège `ENQUEUE` sur la queue (ou `ENQUEUE_ANY`). 2 ### 2.3 Agrégation : stateful + release (taille/timeout) L’Aggregator regroupe selon une **clé de corrélation** et libère selon : - une **limite** (size), - et/ou un **timeout** (`groupTimeout`), qui force la complétion du groupe. 3 > Remarque : si on persiste l’état d’agrégation, il faut aussi gérer l’expiration des métadonnées de groupes pour éviter une croissance mémoire/DB (reaper). 4 ### 2.4 Channels explicites pour audit Spring Integration fournit plusieurs implémentations de channels (Direct, Queue, PublishSubscribe, Executor…). 5 `wireTap` et `ChannelInterceptor` permettent d’auditer le “journey” des messages (la doc mentionne WireTap via interceptor). 6 --- ## 3. Modèle de données (Oracle) ### 3.1 Table CBMESSAGE (source) Colonnes minimum utilisées par l’app : - `ID` (PK / unique) - `BRANCH` - `FILENAME` Colonnes à ajouter (recommandées) pour l’orchestration : - `STATUS` : `NEW`, `IN_PROGRESS`, `DONE`, `ERROR` - `CLAIMED_BY` (instanceId) - `CLAIMED_AT` (timestamp) - `FILE_ID` (FK logique vers CBFILE) - optionnel : `TRY_COUNT`, `LAST_ERROR` Index recommandés : - `(STATUS, CLAIMED_AT)` et/ou `(STATUS, BRANCH, ID)` selon les requêtes. ### 3.2 Table CBFILE (fichier logique) - `FILE_ID` (PK, sequence) - attributs métier (type, physicalType, etc.) - lien implicite : CBMESSAGE.FILE_ID ### 3.3 Table business `CBL_Business_MTM_IN` - contient une ligne par message, référencée via `MSG_ID` (= CBMESSAGE.ID) - on met aussi `FILE_ID` sur ces lignes. ### 3.4 Oracle AQ - une queue existante (type payload dépendant : RAW, objet, JSON, etc.) - on enqueu un message “notification” contenant au minimum : `flowName`, `branch`, `fileName`, `fileId`, `count`, timestamps. --- ## 4. Structures Java ### 4.1 DTO “lite” (JDBC) ```java public final class CbMessageLite { private final long id; private final String branchCode; private final String fileName; public CbMessageLite(long id, String branchCode, String fileName) { this.id = id; this.branchCode = branchCode; this.fileName = fileName; } public long getId() { return id; } public String getBranchCode() { return branchCode; } public String getFileName() { return fileName; } } 
+4.2 FlowRegistry (initialisation au démarrage)
+• chargé depuis ApplicationParameter via FlowRegistryBootstrapper,
+• construit une structure : 
+• Map<String, FlowIndex> flowsByName (clé = flowName ex: MTMIN)
+• FlowIndex contient : 
+• flowName
+• businessTableName (ex: CBL_Business_MTM_IN)
+• Map<String, BranchEntry> branchesByKey où la clé = flowName|branchCode
+• BranchEntry contient : 
+• branchId
+• branchName
+• filePhysicalType
+• cbFileTypeId
+Interfaces proposées
+public final class BranchEntry { /* branchId, branchName, filePhysicalType, cbFileTypeId */ } public final class FlowIndex { private final String flowName; private final String businessTableName; private final Map<String, BranchEntry> branchesByKey; public BranchEntry getBranch(String branchCode) { return branchesByKey.get(flowName + "|" + branchCode); } } public final class FlowRegistry { private final Map<String, FlowIndex> flowsByName; public Optional<FlowIndex> getFlow(String flowName) { return Optional.ofNullable(flowsByName.get(flowName)); } public static String key(String flow, String branch) { return flow + "|" + branch; } } 
+4.3 Bootstrapper (au démarrage)
+• construit un FlowRegistry immuable,
+• swap atomique (AtomicReference) dans un FlowRegistryHolder.
+5. Vue d’ensemble — workflow complet
+flowchart LR subgraph Init[Initialisation] AP[ApplicationParameter] -->|Bootstrap| FR[FlowRegistry] end subgraph Main[Flow principal CBMESSAGE -> CBFILE -> AQ] P[Poller unique JDBC] --> DCH[cbmsg.detected] DCH --> SPLIT[split: 1 message = 1 ligne] SPLIT --> CLASS[cbmsg.classified<br/>enrich headers] CLASS --> AGGIN[cbmsg.aggregate.in] AGGIN --> AGG[Aggregator<br/>corr=flow|branch|fileName<br/>release=size/timeout] AGG --> AGGED[cbmsg.aggregated] AGGED --> EXEC[cbmsg.processing<br/>(ExecutorChannel)] EXEC --> TX[Tx Handler<br/>INSERT CBFILE<br/>UPDATE CBMESSAGE.FILE_ID<br/>UPDATE CBL_Business_*.FILE_ID<br/>ENQUEUE AQ (ON_COMMIT)] TX --> AQED[cbmsg.aq.enqueued] end subgraph Audit[Audit] DCH -.wireTap/interceptor.-> AUDIT[(cbmsg.audit)] CLASS -.wireTap/interceptor.-> AUDIT AGGED -.wireTap/interceptor.-> AUDIT EXEC -.wireTap/interceptor.-> AUDIT AQED -.wireTap/interceptor.-> AUDIT end 
+6. Gestion COB / jour non ouvré (isOpenDay)
+6.1 Décision de conception (recommandée)
+Ne pas “claim” les branches fermées :
+• si isOpenDay(branch) == false alors les lignes restent NEW,
+• l’application ne maintient pas d’agrégats qui grossissent pendant des heures,
+• à la réouverture, le poller traite le backlog.
+Cette décision simplifie fortement la robustesse multi-instances (pas de IN_PROGRESS longue durée).
+6.2 “Un seul lot pendant COB”
+Pour assurer “un seul lot” sur la période COB, le plus fiable est d’utiliser fileName comme identifiant de lot :
+• corrélation = flow|branch|fileName
+• release par inactivité/timeout (ex: 60s sans nouveaux messages) pour absorber un backlog sur plusieurs polls.
+Si vous imposez aussi une limite “size”, vous pouvez produire plusieurs lots pour un même fileName si le backlog dépasse la limite.
+Pour garantir 1 lot, privilégier la release “inactivité” ou une limite très élevée sur les branches concernées.
+7. Canaux (channels) et audit
+7.1 Liste des channels (étapes)
+• cbmsg.detected : messages détectés / claimés
+• cbmsg.classified : headers enrichis
+• cbmsg.aggregate.in : entrée aggregation
+• cbmsg.aggregated : lot relâché
+• cbmsg.processing : traitement batch (ExecutorChannel)
+• cbmsg.aq.enqueued : notification AQ enqueued
+• cbmsg.error : erreurs
+• cbmsg.audit : bus d’audit (PublishSubscribe)
+7.2 Types recommandés
+Spring Integration décrit les implémentations de channels (Direct, PublishSubscribe, Executor, Queue…). 
+• DirectChannel : étapes synchrones / faible overhead
+• PublishSubscribeChannel : audit (plusieurs subscribers)
+• ExecutorChannel : parallélisme contrôlé (entre lots)
+8. Statuts CBMESSAGE (machine d’état)
+stateDiagram-v2 [*] --> NEW NEW --> IN_PROGRESS: claim (SELECT..SKIP LOCKED + UPDATE) IN_PROGRESS --> DONE: tx ok (CBFILE + updates + AQ) commit IN_PROGRESS --> ERROR: tx KO (rollback) + marquage ERROR (compensation) ERROR --> NEW: retry (optionnel, selon TRY_COUNT/policy) 
+9. Détails du flow principal (Spring Integration)
+9.1 Headers standardisés
+• traceId : UUID (audit)
+• flowName : ex MTMIN
+• branch : branchCode
+• fileName
+• dbId : CBMESSAGE.ID
+• groupId : flow|branch|fileName
+9.2 Diagramme détaillé avec channels
+flowchart TB SRC[MessageSource claim Oracle] --> CH1[cbmsg.detected] CH1 --> SPLIT[split] SPLIT --> HDR[enrichHeaders] HDR --> CH2[cbmsg.classified] CH2 --> CH3[cbmsg.aggregate.in] CH3 --> AGG[Aggregator] AGG --> CH4[cbmsg.aggregated] CH4 --> CH5[cbmsg.processing (ExecutorChannel)] CH5 --> TX[Transactional handler] TX --> CH6[cbmsg.aq.enqueued] TX -->|exception| ERR[cbmsg.error] 
+10. Code — configuration des channels
+@Bean(name = "cbmsg.audit") public MessageChannel auditChannel() { return new PublishSubscribeChannel(); } @Bean(name = "cbmsg.detected") public MessageChannel detectedChannel() { return new DirectChannel(); } @Bean(name = "cbmsg.classified") public MessageChannel classifiedChannel() { return new DirectChannel(); } @Bean(name = "cbmsg.aggregate.in") public MessageChannel aggregateInChannel() { return new DirectChannel(); } @Bean(name = "cbmsg.aggregated") public MessageChannel aggregatedChannel() { return new DirectChannel(); } @Bean(name = "cbmsg.processing") public MessageChannel processingChannel(TaskExecutor taskExecutor) { return new ExecutorChannel(taskExecutor); } @Bean(name = "cbmsg.aq.enqueued") public MessageChannel aqEnqueuedChannel() { return new DirectChannel(); } @Bean(name = "cbmsg.error") public MessageChannel errorChannel() { return new PublishSubscribeChannel(); } 
+11. Code — Polling/claim Oracle (MessageSource maison)
+11.1 SQL (Oracle 19c)
+• on filtre par branches ouvertes (via isOpenDay côté Java),
+• SKIP LOCKED pour multi-consumers. 
+SELECT id, branch, filename FROM cbmessage WHERE status = 'NEW' AND branch IN ( ...openBranches... ) ORDER BY id FETCH FIRST :batchSize ROWS ONLY FOR UPDATE SKIP LOCKED 
+Puis :
+UPDATE cbmessage SET status='IN_PROGRESS', claimed_by=:instanceId, claimed_at=SYSTIMESTAMP WHERE id IN (:ids) 
+11.2 Implémentation Java (JdbcTemplate + TransactionTemplate)
+public class CbMessagePollingSource implements MessageSource<List<CbMessageLite>> { private final JdbcTemplate jdbc; private final TransactionTemplate tx; private final EasyFlowMonitoringService monitoring; private final FlowRegistryHolder flowRegistryHolder; private final String flowName; private final String instanceId; private final int batchSize; public CbMessagePollingSource(JdbcTemplate jdbc, PlatformTransactionManager ptm, EasyFlowMonitoringService monitoring, FlowRegistryHolder flowRegistryHolder, String flowName, String instanceId, int batchSize) { this.jdbc = jdbc; this.tx = new TransactionTemplate(ptm); this.monitoring = monitoring; this.flowRegistryHolder = flowRegistryHolder; this.flowName = flowName; this.instanceId = instanceId; this.batchSize = batchSize; } @Override public Message<List<CbMessageLite>> receive() { List<CbMessageLite> batch = tx.execute(s -> { FlowRegistry registry = flowRegistryHolder.current(); FlowIndex flow = registry.getFlow(flowName).orElse(null); if (flow == null) return java.util.Collections.emptyList(); // branches connues + ouvertes List<String> openBranches = flow.getBranchesByKey().keySet().stream() .map(k -> k.split("\\|")[1]) // flow|branch .distinct() .filter(monitoring::isOpenDay) .collect(java.util.stream.Collectors.toList()); if (openBranches.isEmpty()) return java.util.Collections.emptyList(); // Construire un IN (...) simple (ok si nb branches raisonnable) String inSql = openBranches.stream().map(b -> "?") .collect(java.util.stream.Collectors.joining(",")); Object[] args = new Object[openBranches.size() + 1]; args[0] = batchSize; for (int i = 0; i < openBranches.size(); i++) args[i + 1] = openBranches.get(i); List<CbMessageLite> rows = jdbc.query( "SELECT id, branch, filename " + "FROM cbmessage " + "WHERE status='NEW' AND branch IN (" + inSql + ") " + "ORDER BY id " + "FETCH FIRST ? ROWS ONLY " + "FOR UPDATE SKIP LOCKED", // args order: branches... + batchSize => adapter if you prefer NamedParameterJdbcTemplate // Ici on met batchSize en dernier pour simplicité de construction : // => refactor recommandé avec NamedParameterJdbcTemplate rs -> { throw new UnsupportedOperationException("Adapter à NamedParameterJdbcTemplate"); } ); // TODO: UPDATE IN_PROGRESS + commit return rows; }); if (batch == null || batch.isEmpty()) return null; return MessageBuilder.withPayload(batch) .setHeader("flowName", flowName) .setHeader("instanceId", instanceId) .setHeader("traceId", java.util.UUID.randomUUID().toString()) .build(); } } 
+Note importante : pour l’IN (:list) et l’ordre des binds, utilisez plutôt NamedParameterJdbcTemplate (lisible et sûr).
+Aussi, Oracle a une limite classique de 1000 éléments dans un IN : si vous batch > 1000 IDs, préférez batchUpdate / table temporaire.
+12. Code — IntegrationFlow (avec channels + audit hooks)
+@Bean public IntegrationFlow cbMsgFlow(MessageSource<List<CbMessageLite>> pollingSource, FlowRegistryHolder flowRegistryHolder, BranchLimitService limitService, MessageChannel detectedChannel, MessageChannel classifiedChannel, MessageChannel aggregateInChannel, MessageChannel aggregatedChannel, MessageChannel processingChannel, MessageChannel aqEnqueuedChannel) { return IntegrationFlows .from(pollingSource, e -> e.poller(Pollers.fixedDelay(2000).maxMessagesPerPoll(1))) .channel(detectedChannel) .wireTap("cbmsg.audit") // audit non intrusif (copie) 9 .split() .enrichHeaders(h -> h .headerFunction("branch", m -> ((CbMessageLite) m.getPayload()).getBranchCode()) .headerFunction("fileName",m -> ((CbMessageLite) m.getPayload()).getFileName()) .headerFunction("dbId", m -> ((CbMessageLite) m.getPayload()).getId()) .headerFunction("groupId", m -> { String flow = (String) m.getHeaders().get("flowName"); String br = ((CbMessageLite) m.getPayload()).getBranchCode(); String fn = ((CbMessageLite) m.getPayload()).getFileName(); return flow + "|" + br + "|" + fn; }) ) .channel(classifiedChannel) .wireTap("cbmsg.audit") .channel(aggregateInChannel) .aggregate(a -> a .correlationStrategy(m -> m.getHeaders().get("groupId")) // Release = limite par branche OU timeout (flush partiel) 10 .releaseStrategy(g -> { String groupId = (String) g.getGroupId(); // flow|branch|fileName String branch = groupId.split("\\|")[1]; return g.size() >= limitService.limitFor(branch); }) .groupTimeout(60_000) .sendPartialResultOnExpiry(true) .expireGroupsUponCompletion(true) ) .channel(aggregatedChannel) .wireTap("cbmsg.audit") // parallèle contrôlé (pool) via ExecutorChannel 11 .channel(processingChannel) // groupe -> BatchContext .transform(group -> BatchContext.from(group, flowRegistryHolder.current())) .handle("fileBatchTxService", "processBatch") // @Transactional .channel(aqEnqueuedChannel) .wireTap("cbmsg.audit") .get(); } 
+13. Transaction “post-aggregation” (CBFILE + updates + AQ)
+13.1 Séquence
+sequenceDiagram participant SI as Spring Integration Handler (@Transactional) participant DB as Oracle DB participant AQ as Oracle AQ SI->>DB: INSERT CBFILE ... RETURNING FILE_ID SI->>DB: UPDATE CBMESSAGE SET FILE_ID=... SI->>DB: UPDATE CBL_Business_MTM_IN SET FILE_ID=... WHERE MSG_ID IN (...) SI->>AQ: DBMS_AQ.ENQUEUE (visibility=ON_COMMIT) SI->>DB: COMMIT Note over AQ: message visible après COMMIT (ON_COMMIT) 
+13.2 INSERT CBFILE (RETURNING)
+Exemple JDBC (simplifié) :
+Long fileId = jdbc.execute((Connection con) -> { PreparedStatement ps = con.prepareStatement( "INSERT INTO cbfile(flow_name, branch, filename, file_type_id, physical_type, created_at) " + "VALUES (?, ?, ?, ?, ?, SYSTIMESTAMP) RETURNING file_id INTO ?", new String[] { "file_id" } ); // selon driver, RETURNING peut nécessiter CallableStatement; adaptez au standard interne. return ps; }, (PreparedStatement ps) -> { /* set params */ return null; }); 
+Selon votre driver Oracle + politique interne, il est souvent plus simple d’utiliser une sequence (CBFILE_SEQ.NEXTVAL) puis un INSERT avec l’ID déjà connu.
+13.3 Updates (CBMESSAGE + business table)
+• CBMESSAGE :
+UPDATE cbmessage SET file_id = :fileId, status = 'DONE' WHERE id IN (:ids) 
+• business table dynamique (depuis FlowRegistry) :
+UPDATE CBL_Business_MTM_IN SET file_id = :fileId WHERE msg_id IN (:ids) 
+13.4 Enqueue AQ (PL/SQL)
+On impose visibility => ON_COMMIT. 
+Droits requis sur DBMS_AQ et queue. 
+Exemple (payload objet dépendant de votre queue ; ci-dessous pseudo-payload JSON en CLOB/RAW à adapter) :
+public void enqueueOnCommit(String queueName, String payloadJson) { jdbc.execute((Connection con) -> { CallableStatement cs = con.prepareCall( "DECLARE " + " enqueue_options DBMS_AQ.ENQUEUE_OPTIONS_T; " + " message_properties DBMS_AQ.MESSAGE_PROPERTIES_T; " + " msgid RAW(16); " + "BEGIN " + " enqueue_options.visibility := DBMS_AQ.ON_COMMIT; " + " DBMS_AQ.ENQUEUE( " + " queue_name => ?, " + " enqueue_options => enqueue_options, " + " message_properties => message_properties, " + " payload => ?, " + // à adapter au type de payload de la queue " msgid => msgid " + " ); " + "END;" ); cs.setString(1, queueName); cs.setString(2, payloadJson); return cs; }); } 
+14. Audit par interception (ChannelInterceptor / WireTap)
+14.1 WireTap (copie vers cbmsg.audit)
+• Non bloquant pour la logique métier,
+• recommandé pour l’audit “journey”. 
+14.2 ChannelInterceptor (audit + métriques + statut)
+Exemple global :
+@GlobalChannelInterceptor(patterns = "cbmsg.*") public ChannelInterceptor auditInterceptor() { return new ChannelInterceptor() { @Override public Message<?> preSend(Message<?> message, MessageChannel channel) { // écrire audit (DB/log) : channelName, traceId, dbId, groupId, etc. return message; } }; } 
+15. Configuration (exemple application.yml)
+cbmsg: flowName: MTMIN poll: delayMs: 2000 batchSize: 200 aggregation: timeoutMs: 60000 defaultLimit: 100 limitsByBranch: BR1: 100 BR2: 250 BR3: 50 executor: corePool: 8 maxPool: 16 queueCapacity: 1000 oracle: aq: queueName: AQ_ADMIN.MTMIN_HQ_QUEUE 
+16. Points d’attention (remarques de conception)
+• IN clause Oracle : éviter IN > 1000 (IDs). Préférer batchUpdate, table temporaire, ou découpage.
+• COB : si vous ne consommez pas pendant “fermé”, vous évitez des IN_PROGRESS longue durée.
+• Un seul lot COB : si c’est contractuel, s’assurer que fileName (ou un lotId) est stable et que la release ne découpe pas ce lot.
+• Idempotence : 
+• si votre tx batch est relancée, l’INSERT CBFILE doit être contrôlé (ex: unique constraint sur (flow, branch, filename, …) ou détection avant insert).
+• Erreurs : 
+• si le handler tx échoue : rollback (CBFILE/updates/AQ) + compensation (marquer ERROR ou remettre NEW) dans une transaction séparée.
+• Observabilité : 
+• standardiser headers traceId, flowName, branch, fileName, groupId, dbId, fileId.
+• Sécurité AQ : droits DBMS_AQ + ENQUEUE sur queue. 
+17. Annexe — pourquoi SKIP LOCKED ici
+Oracle précise que SKIP LOCKED permet à des consommateurs de sauter les lignes verrouillées par d’autres transactions et de prendre des lignes libres sans attendre, conçu pour environnements multi-consommateurs. 
+18. Annexe — références Spring Integration utiles
+• Aggregator : release + groupTimeout. 
+• Implémentations de channels (Direct, Executor, PublishSubscribe…). 
+• WireTap / log operator (interceptor). 
+• Reaper / expiration de groupes (éviter fuite de métadonnées). 
+Si tu veux, je peux aussi te fournir une **version “prête à copier”** de : - `BatchContext` (extraction du group + récupération FlowIndex/BranchEntry), - `BranchLimitService` (limitsByBranch + default), - `fileBatchTxService.processBatch()` avec SQL complet (sequence CBFILE + batchUpdate + AQ enqueue), - et la variante **“release par inactivité”** (pour garantir 1 lot par `fileName`).21
